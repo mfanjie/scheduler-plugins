@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -79,15 +80,20 @@ func (r *nominationScorer) score(
 	if planStr == "" {
 		return 0, nil
 	}
+	klog.Infof("migration.gocrane.io/plan annotation is found for node\n", node)
 	workloadCountMap := map[string]int{}
 	err := json.Unmarshal([]byte(planStr), &workloadCountMap)
 	if err != nil {
-		klog.Errorf("Failed to ")
+		klog.Errorf("Failed to parse migration.gocrane.io/plan %v for node %v\n", node.Name, err)
 	}
 	for _, owner := range pod.OwnerReferences {
 		for key, value := range workloadCountMap {
-			if fmt.Sprintf("%s/%s/%s", owner.Kind, pod.Namespace, owner.Name) == key {
+			ownerKey := fmt.Sprintf("%s/%s/%s", owner.Kind, pod.Namespace, owner.Name)
+			if ownerKey == key {
+				klog.Errorf("Owner matched %v for pod %v\n", node.Name, err)
 				return int64(value * 100), nil
+			} else {
+
 			}
 		}
 	}
@@ -112,7 +118,10 @@ func New(obj runtime.Object, h framework.Handle) (framework.Plugin, error) {
 
 // NormalizeScore invoked after scoring all nodes.
 func (nomi *Nomination) NormalizeScore(ctx context.Context, state *framework.CycleState, pod *v1.Pod, scores framework.NodeScoreList) *framework.Status {
-	return nil
+	klog.V(4).InfoS("NormalizeScore", "scores", scores, "pod", klog.KObj(pod))
+	normalizedScores := helper.DefaultNormalizeScore(framework.MaxNodeScore, false, scores)
+	klog.V(4).InfoS("NormalizeScore", "normalized scores", scores, "pod", klog.KObj(pod))
+	return normalizedScores
 }
 
 // PreBind is the functions invoked by the framework at "prebind" extension point.
@@ -140,7 +149,7 @@ func (nomi *Nomination) PreBind(ctx context.Context, state *framework.CycleState
 			if fmt.Sprintf("%s/%s/%s", owner.Kind, pod.Namespace, owner.Name) == key {
 				allowBind = true
 				if value > 0 {
-					workloadCountMap[key]--
+					workloadCountMap[key] -= 1
 				}
 			}
 		}
@@ -148,16 +157,28 @@ func (nomi *Nomination) PreBind(ctx context.Context, state *framework.CycleState
 	if !allowBind {
 		return nil
 	}
-	b, err := json.Marshal(workloadCountMap)
+	mergePatch, err := generatedMergePatch(workloadCountMap)
 	if err != nil {
 		return framework.NewStatus(framework.Error, fmt.Sprintf("getting node %q from Snapshot: %v", nodeName, err))
 	}
-	newAnnotationKey := PlanNodeAnnotation
-	mergePatch := []byte(fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s"}}}`, newAnnotationKey, string(b)))
-	_, err = nomi.handle.ClientSet().CoreV1().Nodes().Patch(context.TODO(), nodeName, types.MergePatchType, mergePatch, metav1.PatchOptions{})
+	_, err = nomi.handle.ClientSet().CoreV1().Nodes().Patch(context.TODO(), nodeName, types.MergePatchType, []byte(mergePatch), metav1.PatchOptions{})
 	if err != nil {
 		klog.Errorf("Error patching node: %v\n", err)
 		return framework.NewStatus(framework.Error, fmt.Sprintf("failed to patch node: %v", err))
 	}
 	return nil
+}
+
+func generatedMergePatch(workloadCountMap map[string]int) (string, error) {
+	b, err := json.Marshal(workloadCountMap)
+	if err != nil {
+		return "", err
+	}
+	escapedJSON, err := json.Marshal(string(b))
+	if err != nil {
+		return "", err
+	}
+	newAnnotationKey := PlanNodeAnnotation
+	mergePatch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":%s}}}`, newAnnotationKey, string(escapedJSON))
+	return mergePatch, nil
 }
